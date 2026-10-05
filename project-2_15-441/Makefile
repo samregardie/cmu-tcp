@@ -23,7 +23,7 @@ tests/testing_server: $(OBJS)
 format:
 	pre-commit run --all-files
 
-test:
+test: all
 	sudo -E python3 tests/test_cp1.py
 	sudo -E python3 tests/test_cp1_basic_ack_packets.py
 
