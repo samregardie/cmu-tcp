@@ -65,9 +65,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->my_isn = random_isn();
   sock->peer_isn = 0;
 
-  // Set from the ISNs by cmu_handshake() once connected.
-  sock->window.last_ack_received = 0;
-  sock->window.next_seq_expected = 0;
+  // Sequence numbers are set from the ISNs by cmu_handshake().
+  memset(&sock->window, 0, sizeof(sock->window));
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");

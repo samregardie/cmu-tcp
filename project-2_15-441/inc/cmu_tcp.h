@@ -39,9 +39,36 @@ typedef enum {
   STATE_CONNECTED,
 } cmu_conn_state_t;
 
+/**
+ * A run of bytes and its starting sequence number. Used for sent packets kept
+ * until acked, and for out-of-order data kept until the gap before it fills.
+ */
+typedef struct segment {
+  uint32_t seq;
+  uint16_t len;
+  uint8_t* data;
+  struct segment* next;
+} segment_t;
+
+/**
+ * An ACK number N means every byte before N has been received; N is the next
+ * byte expected.
+ */
 typedef struct {
-  uint32_t next_seq_expected;
-  uint32_t last_ack_received;
+  // Sender state (backend thread only).
+  uint32_t oldest_pending;     // Oldest byte not yet acked.
+  uint32_t able_to_send;       // Next new byte to send (lowest unsent seq).
+  segment_t* in_flight;        // Sent packets not fully acked, oldest first.
+  segment_t* in_flight_tail;
+  uint8_t* unsent;             // App data taken from sending_buf, not sent.
+  int unsent_off;              // Bytes of `unsent` already sent.
+  int unsent_len;              // Total bytes in `unsent`.
+  int timer_running;
+  int64_t timer_deadline;      // Monotonic ms.
+
+  // Receiver state (backend thread, under recv_lock).
+  uint32_t next_seq_expected;  // The ACK number we send.
+  segment_t* out_of_order;     // Received past a gap, sorted by seq.
 } window_t;
 
 /**
