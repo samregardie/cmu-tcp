@@ -31,12 +31,15 @@
  * Connection states
  *   Client: IDLE --(send SYN)--> SYN_SENT --(SYN-ACK, send ACK)--> CONNECTED
  *   Server: IDLE --(SYN, send SYN-ACK)--> WAITING_FOR_ACK --(ACK)--> CONNECTED
+ *   Close:  CONNECTED --(cmu_close; all data ACKed, or gave up)-->
+ *           WAITING_FOR_FIN_ACK --(ACK of FIN, or 2 x DEFAULT_TIMEOUT)--> exit
  */
 typedef enum {
   STATE_IDLE = 0,
   STATE_SYN_SENT,
   STATE_WAITING_FOR_ACK,
   STATE_CONNECTED,
+  STATE_WAITING_FOR_FIN_ACK,
 } cmu_conn_state_t;
 
 /**
@@ -65,6 +68,13 @@ typedef struct {
   int unsent_len;              // Total bytes in `unsent`.
   int timer_running;
   int64_t timer_deadline;      // Monotonic ms.
+  int timeouts_without_ack;    // Consecutive timer expiries with no ACK.
+
+  // Teardown (backend thread only).
+  uint32_t fin_seq;            // Our FIN's sequence number.
+  int fin_resends;             // FIN retransmissions so far.
+  int64_t fin_next_resend;     // Monotonic ms.
+  int64_t fin_give_up;         // Monotonic ms; exit even if not ACKed.
 
   // Receiver state (backend thread, under recv_lock).
   uint32_t next_seq_expected;  // The ACK number we send.
@@ -102,6 +112,7 @@ typedef struct {
   cmu_conn_state_t state;
   uint32_t my_isn;
   uint32_t peer_isn;
+  int peer_fin_received;  // Peer has closed. Protected by recv_lock.
 } cmu_socket_t;
 
 /*

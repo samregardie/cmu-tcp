@@ -34,6 +34,12 @@
 // Handshake gives up after this many unanswered transmissions.
 #define MAX_HANDSHAKE_ATTEMPTS 10
 
+// After the first FIN, resend it this many times, evenly spaced, and exit
+// 2 x DEFAULT_TIMEOUT after the first FIN if it is never ACKed. Giving up on
+// unACKed data after cmu_close reuses MAX_HANDSHAKE_ATTEMPTS.
+#define FIN_RESENDS 3
+#define FIN_GIVE_UP_MS (2 * DEFAULT_TIMEOUT)
+
 // How long each backend loop pass waits for a packet. New app data and timer
 // expiry are noticed at most this late.
 #define BACKEND_POLL_MS 1
@@ -170,6 +176,9 @@ static void free_segments(segment_t *seg) {
  */
 static void handle_ack(cmu_socket_t *sock, uint32_t ack) {
   window_t *w = &sock->window;
+
+  // Any ACK shows the peer is still there.
+  w->timeouts_without_ack = 0;
 
   // Ignore ACKs at or below oldest_pending (no new info) and ACKs beyond
   // anything we've sent.
@@ -312,7 +321,47 @@ static void check_timer(cmu_socket_t *sock) {
   for (segment_t *seg = w->in_flight; seg != NULL; seg = seg->next) {
     send_data_packet(sock, seg->seq, seg->data, seg->len);
   }
+  w->timeouts_without_ack++;
   timer_restart(sock);
+}
+
+/**
+ * Sends our FIN (FIN|ACK, carrying our cumulative ACK).
+ */
+static void send_fin(cmu_socket_t *sock) {
+  send_header_only(sock, sock->window.fin_seq, sock->window.next_seq_expected,
+                   FIN_FLAG_MASK | ACK_FLAG_MASK);
+}
+
+/**
+ * Starts closing: the FIN takes the next sequence number, so its ACK is
+ * fin_seq + 1. Any data not yet sent is abandoned.
+ */
+static void start_close(cmu_socket_t *sock) {
+  window_t *w = &sock->window;
+  int64_t now = now_ms();
+
+  w->fin_seq = w->able_to_send;
+  w->able_to_send += 1;
+  w->fin_resends = 0;
+  w->fin_next_resend = now + FIN_GIVE_UP_MS / (FIN_RESENDS + 1);
+  w->fin_give_up = now + FIN_GIVE_UP_MS;
+  send_fin(sock);
+  sock->state = STATE_WAITING_FOR_FIN_ACK;
+}
+
+/**
+ * Receiver side of a FIN. If everything before it has arrived, the peer is
+ * closed (it uses one sequence number). Always ACKs. Caller holds recv_lock.
+ */
+static void handle_fin(cmu_socket_t *sock, uint32_t seq) {
+  window_t *w = &sock->window;
+  if (!sock->peer_fin_received && seq == w->next_seq_expected) {
+    w->next_seq_expected = seq + 1;
+    sock->peer_fin_received = 1;
+  }
+  send_header_only(sock, w->able_to_send, w->next_seq_expected,
+                   ACK_FLAG_MASK);
 }
 
 /**
@@ -356,7 +405,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt,
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
-  if (sock->state != STATE_CONNECTED) {
+  if (sock->state != STATE_CONNECTED &&
+      sock->state != STATE_WAITING_FOR_FIN_ACK) {
     handle_handshake_message(sock, pkt, from);
     return;
   }
@@ -377,6 +427,9 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt,
   }
   if (get_payload_len(pkt) > 0) {
     handle_data(sock, get_seq(hdr), get_payload(pkt), get_payload_len(pkt));
+  }
+  if (flags & FIN_FLAG_MASK) {
+    handle_fin(sock, get_seq(hdr));
   }
 }
 
@@ -510,7 +563,7 @@ int cmu_handshake(cmu_socket_t *sock) {
 void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   window_t *w = &sock->window;
-  int death, send_signal;
+  int death, send_signal, peer_closed;
 
   while (1) {
     while (pthread_mutex_lock(&(sock->death_lock)) != 0) {
@@ -521,9 +574,32 @@ void *begin_backend(void *in) {
     // 1. Take in new app data.
     take_app_data(sock);
 
-    // On close, exit only once everything written has been sent and acked.
-    if (death && w->unsent_len == 0 && w->oldest_pending == w->able_to_send) {
-      break;
+    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    }
+    peer_closed = sock->peer_fin_received;
+    pthread_mutex_unlock(&(sock->recv_lock));
+
+    // Teardown.
+    if (sock->state == STATE_CONNECTED && death) {
+      if (peer_closed) {
+        break;  // Peer already closed: no FIN of our own.
+      }
+      int all_acked =
+          w->unsent_len == 0 && w->oldest_pending == w->able_to_send;
+      int gave_up = w->timeouts_without_ack >= MAX_HANDSHAKE_ATTEMPTS;
+      if (all_acked || gave_up) {
+        start_close(sock);
+      }
+    } else if (sock->state == STATE_WAITING_FOR_FIN_ACK) {
+      int64_t now = now_ms();
+      if (!before(w->oldest_pending, w->fin_seq + 1) || now >= w->fin_give_up) {
+        break;  // FIN ACKed, or out of time.
+      }
+      if (w->fin_resends < FIN_RESENDS && now >= w->fin_next_resend) {
+        send_fin(sock);
+        w->fin_resends++;
+        w->fin_next_resend = now + FIN_GIVE_UP_MS / (FIN_RESENDS + 1);
+      }
     }
 
     // 2. Check for packets, waiting up to BACKEND_POLL_MS.
@@ -532,15 +608,25 @@ void *begin_backend(void *in) {
       check_for_data(sock, NO_WAIT);
     }
 
-    // 3. Send whatever fits in the window.
-    send_ready(sock);
+    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    }
+    peer_closed = sock->peer_fin_received;
+    pthread_mutex_unlock(&(sock->recv_lock));
 
-    // 4. Retransmit if the timer expired.
-    check_timer(sock);
+    // Once the peer has closed, stop sending our own data.
+    if (!peer_closed) {
+      // 3. Send whatever fits in the window (not after our FIN).
+      if (sock->state == STATE_CONNECTED) {
+        send_ready(sock);
+      }
+
+      // 4. Retransmit if the timer expired.
+      check_timer(sock);
+    }
 
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
     }
-    send_signal = sock->received_len > 0;
+    send_signal = sock->received_len > 0 || sock->peer_fin_received;
     pthread_mutex_unlock(&(sock->recv_lock));
 
     if (send_signal) {

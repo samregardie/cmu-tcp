@@ -64,6 +64,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->state = STATE_IDLE;
   sock->my_isn = random_isn();
   sock->peer_isn = 0;
+  sock->peer_fin_received = 0;
 
   // Sequence numbers are set from the ISNs by cmu_handshake().
   memset(&sock->window, 0, sizeof(sock->window));
@@ -165,7 +166,7 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
 
   switch (flags) {
     case NO_FLAG:
-      while (sock->received_len == 0) {
+      while (sock->received_len == 0 && !sock->peer_fin_received) {
         pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
       }
     // Fall through.
@@ -189,6 +190,9 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
           sock->received_buf = NULL;
           sock->received_len = 0;
         }
+      } else if (sock->peer_fin_received) {
+        // Peer closed and everything it sent has been read.
+        read_len = EXIT_ERROR;
       }
       break;
     default:

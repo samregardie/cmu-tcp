@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_cp1_handshake import (  # noqa: E402
     ACK,
     CODE_DIR,
+    FIN,
     HDR,
     SYN,
     T,
@@ -202,8 +203,14 @@ def test_large_transfer_split_and_intact():
             f"received {len(received)} of {size} bytes",
         )
         check(bytes(received) == data, "received data differs from file")
+
+        # ACK the sender's FIN (it uses one sequence number).
+        fin = peer.recv_matching(lambda p: p.flags & FIN, 2 * T)
+        check(fin is not None, "sender never sent a FIN")
+        check(fin.seq == expected, f"FIN seq {fin.seq}, want {expected}")
+        peer.send(y + 1, (fin.seq + 1) & 0xFFFFFFFF, ACK)
         try:
-            proc.wait(timeout=2 * T)
+            proc.wait(timeout=T)
         except subprocess.TimeoutExpired:
             raise AssertionError("cmu_close did not return after all ACKed")
     finally:
