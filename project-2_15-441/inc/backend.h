@@ -16,11 +16,22 @@
 #ifndef PROJECT_2_15_441_INC_BACKEND_H_
 #define PROJECT_2_15_441_INC_BACKEND_H_
 
+#include "cmu_tcp.h"
+
 /**
  * Launches the CMU-TCP backend.
  *
  * @param in the socket to be used for backend processing.
  */
 void* begin_backend(void* in);
+
+/**
+ * Runs the connection handshake. Blocks until the socket is connected.
+ *
+ * @param sock The socket to connect. `my_isn` must already be set.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int cmu_handshake(cmu_socket_t* sock);
 
 #endif  // PROJECT_2_15_441_INC_BACKEND_H_

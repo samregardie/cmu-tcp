@@ -45,6 +45,78 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 }
 
 /**
+ * Sends a packet with no payload and no extension.
+ *
+ * @param sock The socket to send on.
+ * @param seq Sequence number to put in the header.
+ * @param ack Acknowledgement number to put in the header.
+ * @param flags Header flags (e.g. `SYN_FLAG_MASK | ACK_FLAG_MASK`).
+ */
+static void send_header_only(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
+                             uint8_t flags) {
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint8_t *pkt =
+      create_packet(sock->my_port, ntohs(sock->conn.sin_port), seq, ack, hlen,
+                    hlen, flags, 1, 0, NULL, NULL, 0);
+  sendto(sock->socket, pkt, hlen, 0, (struct sockaddr *)&(sock->conn),
+         sizeof(sock->conn));
+  free(pkt);
+}
+
+/**
+ * Handles a packet received before the connection is established.
+ *
+ * @param sock The socket that received the packet.
+ * @param pkt The packet data received by the socket.
+ */
+static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt) {
+  cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
+  uint8_t flags = get_flags(hdr);
+
+  switch (sock->state) {
+    case STATE_IDLE:
+      // Server: on SYN, send SYN-ACK (seq = y, ack = client ISN + 1).
+      if (flags == SYN_FLAG_MASK) {
+        sock->peer_isn = get_seq(hdr);
+        send_header_only(sock, sock->my_isn, sock->peer_isn + 1,
+                         SYN_FLAG_MASK | ACK_FLAG_MASK);
+        sock->state = STATE_CONNECTING;
+      }
+      // Any non-SYN packet is ignored.
+      break;
+
+    case STATE_CONNECTING:
+      // Server: on final ACK (seq = client ISN + 1, ack = y + 1), connected.
+      if (flags == ACK_FLAG_MASK && get_seq(hdr) == sock->peer_isn + 1 &&
+          get_ack(hdr) == sock->my_isn + 1) {
+        sock->state = STATE_CONNECTED;
+      }
+      // TODO(design): a repeated SYN arrives here. What do you send, and
+      // with which server ISN?
+      // TODO(design): can anything other than a pure ACK complete the
+      // handshake (e.g. a data packet with the ACK flag set)?
+      // TODO(design): anything else that arrives here.
+      break;
+
+    case STATE_SYN_SENT:
+      // Client: on SYN-ACK with ack = my ISN + 1, send final ACK
+      // (seq = my ISN + 1, ack = server ISN + 1), connected.
+      if (flags == (SYN_FLAG_MASK | ACK_FLAG_MASK) &&
+          get_ack(hdr) == sock->my_isn + 1) {
+        sock->peer_isn = get_seq(hdr);
+        send_header_only(sock, sock->my_isn + 1, sock->peer_isn + 1,
+                         ACK_FLAG_MASK);
+        sock->state = STATE_CONNECTED;
+      }
+      // TODO(design): a SYN-ACK with the wrong ack, or any other packet.
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
  * Updates the socket information to represent the newly received packet.
  *
  * In the current stop-and-wait implementation, this function also sends an
@@ -57,6 +129,13 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
+  if (sock->state != STATE_CONNECTED) {
+    handle_handshake_message(sock, pkt);
+    return;
+  }
+
+  // TODO(design): a duplicate SYN-ACK reaching a CONNECTED client (lost
+  // final ACK). Right now it falls into the starter's default case below.
   switch (flags) {
     case ACK_FLAG_MASK: {
       uint32_t ack = get_ack(hdr);
@@ -215,6 +294,26 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       data_offset += payload_len;
     }
   }
+}
+
+int cmu_handshake(cmu_socket_t *sock) {
+  if (sock->type == TCP_INITIATOR) {
+    // Client: send SYN carrying my ISN.
+    send_header_only(sock, sock->my_isn, 0, SYN_FLAG_MASK);
+    sock->state = STATE_SYN_SENT;
+  } else {
+    sock->state = STATE_IDLE;
+  }
+
+  while (sock->state != STATE_CONNECTED) {
+    // Waits up to DEFAULT_TIMEOUT for a packet, then handles it.
+    check_for_data(sock, TIMEOUT);
+
+    // TODO(design): timeouts. Who retransmits what, how many times, and when
+    // do we give up and return EXIT_ERROR? Note check_for_data() does not
+    // currently tell you whether it timed out or handled a packet.
+  }
+  return EXIT_SUCCESS;
 }
 
 void *begin_backend(void *in) {

@@ -27,6 +27,18 @@
 #define EXIT_ERROR -1
 #define EXIT_FAILURE 1
 
+/**
+ * Connection states
+ *   Client: IDLE --(send SYN)--> SYN_SENT --(SYN-ACK, send ACK)--> CONNECTED
+ *   Server: IDLE --(SYN, send SYN-ACK)--> CONNECTING --(ACK)--> CONNECTED
+ */
+typedef enum {
+  STATE_IDLE = 0,
+  STATE_SYN_SENT,
+  STATE_CONNECTING,
+  STATE_CONNECTED,
+} cmu_conn_state_t;
+
 typedef struct {
   uint32_t next_seq_expected;
   uint32_t last_ack_received;
@@ -60,6 +72,9 @@ typedef struct {
   int dying;
   pthread_mutex_t death_lock;
   window_t window;
+  cmu_conn_state_t state;
+  uint32_t my_isn;
+  uint32_t peer_isn;
 } cmu_socket_t;
 
 /*

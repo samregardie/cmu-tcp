@@ -18,10 +18,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "backend.h"
+
+/**
+ * Picks a random initial sequence number.
+ */
+static uint32_t random_isn(void) {
+  uint32_t isn;
+  if (getrandom(&isn, sizeof(isn), 0) != (ssize_t)sizeof(isn)) {
+    perror("ERROR getrandom");
+    isn = (uint32_t)rand();
+  }
+  return isn;
+}
 
 int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
                const int port, const char *server_ip) {
@@ -48,9 +61,13 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dying = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
-  // FIXME: Sequence numbers should be randomly initialized. The next expected
-  // sequence number should be initialized according to the SYN packet from the
-  // other side of the connection.
+  sock->state = STATE_IDLE;
+  sock->my_isn = random_isn();
+  sock->peer_isn = 0;
+
+  // TODO(design): Once the handshake completes, these should be derived from
+  // my_isn / peer_isn (your answer to "what seq does the first data byte
+  // carry?"). Left at 0 so the starter data path still works for now.
   sock->window.last_ack_received = 0;
   sock->window.next_seq_expected = 0;
 
@@ -103,6 +120,11 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   }
   getsockname(sockfd, (struct sockaddr *)&my_addr, &len);
   sock->my_port = ntohs(my_addr.sin_port);
+
+  // Block until connected, on both client and server.
+  if (cmu_handshake(sock) < 0) {
+    return EXIT_ERROR;
+  }
 
   pthread_create(&(sock->thread_id), NULL, begin_backend, (void *)sock);
   return EXIT_SUCCESS;
