@@ -65,9 +65,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->my_isn = random_isn();
   sock->peer_isn = 0;
 
-  // TODO(design): Once the handshake completes, these should be derived from
-  // my_isn / peer_isn (your answer to "what seq does the first data byte
-  // carry?"). Left at 0 so the starter data path still works for now.
+  // Set from the ISNs by cmu_handshake() once connected.
   sock->window.last_ack_received = 0;
   sock->window.next_seq_expected = 0;
 
@@ -123,6 +121,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
 
   // Block until connected, on both client and server.
   if (cmu_handshake(sock) < 0) {
+    fprintf(stderr, "ERROR handshake failed\n");
+    close(sockfd);
     return EXIT_ERROR;
   }
 

@@ -24,11 +24,15 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "cmu_packet.h"
 #include "cmu_tcp.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+
+// Handshake gives up after this many unanswered transmissions.
+#define MAX_HANDSHAKE_ATTEMPTS 10
 
 /**
  * Tells if a given sequence number has been acknowledged by the socket.
@@ -68,8 +72,10 @@ static void send_header_only(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
  *
  * @param sock The socket that received the packet.
  * @param pkt The packet data received by the socket.
+ * @param from Address the packet came from.
  */
-static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt) {
+static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt,
+                                     const struct sockaddr_in *from) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
@@ -77,25 +83,38 @@ static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt) {
     case STATE_IDLE:
       // Server: on SYN, send SYN-ACK (seq = y, ack = client ISN + 1).
       if (flags == SYN_FLAG_MASK) {
+        // Accepted SYN: this sender becomes the peer.
+        sock->conn = *from;
         sock->peer_isn = get_seq(hdr);
         send_header_only(sock, sock->my_isn, sock->peer_isn + 1,
                          SYN_FLAG_MASK | ACK_FLAG_MASK);
-        sock->state = STATE_CONNECTING;
+        sock->state = STATE_WAITING_FOR_ACK;
       }
       // Any non-SYN packet is ignored.
       break;
 
-    case STATE_CONNECTING:
-      // Server: on final ACK (seq = client ISN + 1, ack = y + 1), connected.
-      if (flags == ACK_FLAG_MASK && get_seq(hdr) == sock->peer_isn + 1 &&
-          get_ack(hdr) == sock->my_isn + 1) {
-        sock->state = STATE_CONNECTED;
+    case STATE_WAITING_FOR_ACK:
+      if (flags & ACK_FLAG_MASK) {
+        int pure_ack = flags == ACK_FLAG_MASK && get_payload_len(pkt) == 0;
+        if (pure_ack) {
+          // Pure ACK: seq = client ISN + 1, ack = y + 1 exactly.
+          if (get_seq(hdr) == sock->peer_isn + 1 &&
+              get_ack(hdr) == sock->my_isn + 1) {
+            sock->state = STATE_CONNECTED;
+          }
+        } else if (after(get_seq(hdr), sock->peer_isn) &&
+                   after(get_ack(hdr), sock->my_isn)) {
+          // Any other packet with ACK set: seq and ack only need to be past
+          // the ISNs. Its payload is dropped so data handling stays in one
+          // place (handle_message once CONNECTED).
+          sock->state = STATE_CONNECTED;
+        }
+      } else if (flags == SYN_FLAG_MASK && get_seq(hdr) == sock->peer_isn) {
+        // Repeated SYN (same client ISN): resend the same SYN-ACK, same ISN.
+        send_header_only(sock, sock->my_isn, sock->peer_isn + 1,
+                         SYN_FLAG_MASK | ACK_FLAG_MASK);
       }
-      // TODO(design): a repeated SYN arrives here. What do you send, and
-      // with which server ISN?
-      // TODO(design): can anything other than a pure ACK complete the
-      // handshake (e.g. a data packet with the ACK flag set)?
-      // TODO(design): anything else that arrives here.
+      // Anything else is ignored.
       break;
 
     case STATE_SYN_SENT:
@@ -108,7 +127,7 @@ static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt) {
                          ACK_FLAG_MASK);
         sock->state = STATE_CONNECTED;
       }
-      // TODO(design): a SYN-ACK with the wrong ack, or any other packet.
+      // Anything else (including a SYN-ACK with the wrong ack) is ignored.
       break;
 
     default:
@@ -124,18 +143,28 @@ static void handle_handshake_message(cmu_socket_t *sock, uint8_t *pkt) {
  *
  * @param sock The socket used for handling packets received.
  * @param pkt The packet data received by the socket.
+ * @param from Address the packet came from. Received packets never change
+ *             `sock->conn`; only an accepted SYN does (in the handshake).
  */
-void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
+void handle_message(cmu_socket_t *sock, uint8_t *pkt,
+                    const struct sockaddr_in *from) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
   if (sock->state != STATE_CONNECTED) {
-    handle_handshake_message(sock, pkt);
+    handle_handshake_message(sock, pkt, from);
     return;
   }
 
-  // TODO(design): a duplicate SYN-ACK reaching a CONNECTED client (lost
-  // final ACK). Right now it falls into the starter's default case below.
+  // Client: a SYN-ACK after connecting means our final ACK may have been
+  // lost, so ACK it again (same values as the original final ACK).
+  if (sock->type == TCP_INITIATOR &&
+      flags == (SYN_FLAG_MASK | ACK_FLAG_MASK)) {
+    send_header_only(sock, sock->my_isn + 1, sock->peer_isn + 1,
+                     ACK_FLAG_MASK);
+    return;
+  }
+
   switch (flags) {
     case ACK_FLAG_MASK: {
       uint32_t ack = get_ack(hdr);
@@ -197,20 +226,25 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
  * @param sock The socket used for receiving data on the connection.
  * @param flags Flags that determine how the socket should wait for data. Check
  *             `cmu_read_mode_t` for more information.
+ *
+ * @return 1 if a packet was received and handled, 0 otherwise (e.g. the
+ *         `TIMEOUT` wait expired with nothing to read).
  */
-void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
+int check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
   cmu_tcp_header_t hdr;
   uint8_t *pkt;
-  socklen_t conn_len = sizeof(sock->conn);
+  struct sockaddr_in from;
+  socklen_t conn_len = sizeof(from);
   ssize_t len = 0;
   uint32_t plen = 0, buf_size = 0, n = 0;
+  int handled = 0;
 
   while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
   }
   switch (flags) {
     case NO_FLAG:
       len = recvfrom(sock->socket, &hdr, sizeof(cmu_tcp_header_t), MSG_PEEK,
-                     (struct sockaddr *)&(sock->conn), &conn_len);
+                     (struct sockaddr *)&from, &conn_len);
       break;
     case TIMEOUT: {
       // Using `poll` here so that we can specify a timeout.
@@ -225,7 +259,7 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
     // Fallthrough.
     case NO_WAIT:
       len = recvfrom(sock->socket, &hdr, sizeof(cmu_tcp_header_t),
-                     MSG_DONTWAIT | MSG_PEEK, (struct sockaddr *)&(sock->conn),
+                     MSG_DONTWAIT | MSG_PEEK, (struct sockaddr *)&from,
                      &conn_len);
       break;
     default:
@@ -236,13 +270,15 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
     pkt = malloc(plen);
     while (buf_size < plen) {
       n = recvfrom(sock->socket, pkt + buf_size, plen - buf_size, 0,
-                   (struct sockaddr *)&(sock->conn), &conn_len);
+                   (struct sockaddr *)&from, &conn_len);
       buf_size = buf_size + n;
     }
-    handle_message(sock, pkt);
+    handle_message(sock, pkt, &from);
     free(pkt);
+    handled = 1;
   }
   pthread_mutex_unlock(&(sock->recv_lock));
+  return handled;
 }
 
 /**
@@ -296,23 +332,76 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
   }
 }
 
+/**
+ * Current time on a monotonic clock, in milliseconds.
+ */
+static int64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 int cmu_handshake(cmu_socket_t *sock) {
+  int attempts = 0;
+  int64_t deadline = 0;
+
   if (sock->type == TCP_INITIATOR) {
     // Client: send SYN carrying my ISN.
     send_header_only(sock, sock->my_isn, 0, SYN_FLAG_MASK);
     sock->state = STATE_SYN_SENT;
+    attempts = 1;
+    deadline = now_ms() + DEFAULT_TIMEOUT;
   } else {
     sock->state = STATE_IDLE;
   }
 
   while (sock->state != STATE_CONNECTED) {
-    // Waits up to DEFAULT_TIMEOUT for a packet, then handles it.
-    check_for_data(sock, TIMEOUT);
+    if (sock->state == STATE_IDLE) {
+      // Server: wait for a SYN with no timeout.
+      check_for_data(sock, NO_FLAG);
+      if (sock->state == STATE_WAITING_FOR_ACK) {
+        // The SYN-ACK was just sent; start its timer.
+        attempts = 1;
+        deadline = now_ms() + DEFAULT_TIMEOUT;
+      }
+      continue;
+    }
 
-    // TODO(design): timeouts. Who retransmits what, how many times, and when
-    // do we give up and return EXIT_ERROR? Note check_for_data() does not
-    // currently tell you whether it timed out or handled a packet.
+    // Wait only for the time left until the deadline, so packets that get
+    // ignored don't push the timeout back.
+    int64_t remaining = deadline - now_ms();
+    if (remaining > 0) {
+      struct pollfd pfd = {.fd = sock->socket, .events = POLLIN};
+      if (poll(&pfd, 1, (int)remaining) > 0) {
+        check_for_data(sock, NO_WAIT);
+      }
+      continue;
+    }
+
+    // Timed out: give up, or retransmit with the same ISN.
+    if (attempts >= MAX_HANDSHAKE_ATTEMPTS) {
+      if (sock->state == STATE_WAITING_FOR_ACK) {
+        // Server: abandon this client and wait for a new SYN.
+        sock->state = STATE_IDLE;
+        sock->peer_isn = 0;
+        continue;
+      }
+      return EXIT_ERROR;
+    }
+    if (sock->state == STATE_SYN_SENT) {
+      send_header_only(sock, sock->my_isn, 0, SYN_FLAG_MASK);
+    } else if (sock->state == STATE_WAITING_FOR_ACK) {
+      send_header_only(sock, sock->my_isn, sock->peer_isn + 1,
+                       SYN_FLAG_MASK | ACK_FLAG_MASK);
+    }
+    attempts++;
+    deadline = now_ms() + DEFAULT_TIMEOUT;
   }
+
+  // The SYN used up one sequence number in each direction, so data starts at
+  // ISN + 1 on both sides.
+  sock->window.last_ack_received = sock->my_isn + 1;
+  sock->window.next_seq_expected = sock->peer_isn + 1;
   return EXIT_SUCCESS;
 }
 

@@ -30,12 +30,12 @@
 /**
  * Connection states
  *   Client: IDLE --(send SYN)--> SYN_SENT --(SYN-ACK, send ACK)--> CONNECTED
- *   Server: IDLE --(SYN, send SYN-ACK)--> CONNECTING --(ACK)--> CONNECTED
+ *   Server: IDLE --(SYN, send SYN-ACK)--> WAITING_FOR_ACK --(ACK)--> CONNECTED
  */
 typedef enum {
   STATE_IDLE = 0,
   STATE_SYN_SENT,
-  STATE_CONNECTING,
+  STATE_WAITING_FOR_ACK,
   STATE_CONNECTED,
 } cmu_conn_state_t;
 
