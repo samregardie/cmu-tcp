@@ -34,6 +34,10 @@
 // Handshake gives up after this many unanswered transmissions.
 #define MAX_HANDSHAKE_ATTEMPTS 10
 
+// How long each backend loop pass waits for a packet. New app data and timer
+// expiry are noticed at most this late.
+#define BACKEND_POLL_MS 1
+
 /**
  * Current time on a monotonic clock, in milliseconds.
  */
@@ -522,8 +526,11 @@ void *begin_backend(void *in) {
       break;
     }
 
-    // 2. Check for packets (no waiting).
-    check_for_data(sock, NO_WAIT);
+    // 2. Check for packets, waiting up to BACKEND_POLL_MS.
+    struct pollfd pfd = {.fd = sock->socket, .events = POLLIN};
+    if (poll(&pfd, 1, BACKEND_POLL_MS) > 0) {
+      check_for_data(sock, NO_WAIT);
+    }
 
     // 3. Send whatever fits in the window.
     send_ready(sock);
