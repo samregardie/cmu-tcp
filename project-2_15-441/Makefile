@@ -6,7 +6,7 @@ CC=gcc
 FLAGS = -pthread -fPIC -g -ggdb -pedantic -Wall -Wextra -DDEBUG -I$(INC_DIR)
 OBJS = $(BUILD_DIR)/cmu_packet.o $(BUILD_DIR)/cmu_tcp.o $(BUILD_DIR)/backend.o
 
-all: server client tests/testing_server
+all: server client tests/testing_server tests/bulk_sender
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(FLAGS) -c -o $@ $<
@@ -20,6 +20,9 @@ client: $(OBJS) $(SRC_DIR)/client.c
 tests/testing_server: $(OBJS)
 	$(CC) $(FLAGS) tests/testing_server.c -o tests/testing_server $(OBJS)
 
+tests/bulk_sender: $(OBJS) tests/bulk_sender.c
+	$(CC) $(FLAGS) tests/bulk_sender.c -o tests/bulk_sender $(OBJS)
+
 format:
 	pre-commit run --all-files
 
@@ -29,4 +32,4 @@ test: all
 
 clean:
 	rm -f $(BUILD_DIR)/*.o peer client server
-	rm -f tests/testing_server
+	rm -f tests/testing_server tests/bulk_sender
