@@ -8,7 +8,9 @@ OBJS = $(BUILD_DIR)/cmu_packet.o $(BUILD_DIR)/cmu_tcp.o $(BUILD_DIR)/backend.o
 
 all: server client tests/testing_server tests/bulk_sender
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+HEADERS = $(wildcard $(INC_DIR)/*.h)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(HEADERS)
 	$(CC) $(FLAGS) -c -o $@ $<
 
 server: $(OBJS) $(SRC_DIR)/server.c

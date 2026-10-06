@@ -31,8 +31,13 @@
  * Connection states
  *   Client: IDLE --(send SYN)--> SYN_SENT --(SYN-ACK, send ACK)--> CONNECTED
  *   Server: IDLE --(SYN, send SYN-ACK)--> WAITING_FOR_ACK --(ACK)--> CONNECTED
- *   Close:  CONNECTED --(cmu_close; all data ACKed, or gave up)-->
- *           WAITING_FOR_FIN_ACK --(ACK of FIN, or 2 x DEFAULT_TIMEOUT)--> exit
+ *   Close:  CONNECTED --(cmu_close; all data ACKed, or gave up; send FIN)-->
+ *           WAITING_FOR_FIN_ACK --(ACK of FIN, or 2 x DEFAULT_TIMEOUT)-->
+ *             peer FIN came before we closed  --> exit
+ *             peer FIN came after our FIN     --> FINAL_WAIT
+ *             no peer FIN yet                 --> WAITING_FOR_PEER_FIN
+ *           WAITING_FOR_PEER_FIN --(peer FIN, ACK it)--> FINAL_WAIT
+ *           FINAL_WAIT --(two segment lifetimes)--> exit
  */
 typedef enum {
   STATE_IDLE = 0,
@@ -40,6 +45,8 @@ typedef enum {
   STATE_WAITING_FOR_ACK,
   STATE_CONNECTED,
   STATE_WAITING_FOR_FIN_ACK,
+  STATE_WAITING_FOR_PEER_FIN,
+  STATE_FINAL_WAIT,
 } cmu_conn_state_t;
 
 /**
@@ -74,7 +81,9 @@ typedef struct {
   uint32_t fin_seq;            // Our FIN's sequence number.
   int fin_resends;             // FIN retransmissions so far.
   int64_t fin_next_resend;     // Monotonic ms.
-  int64_t fin_give_up;         // Monotonic ms; exit even if not ACKed.
+  int64_t fin_give_up;         // Monotonic ms; stop waiting for FIN's ACK.
+  int peer_closed_first;       // Peer's FIN arrived before we sent ours.
+  int64_t final_wait_end;      // Monotonic ms; leave FINAL_WAIT.
 
   // Receiver state (backend thread, under recv_lock).
   uint32_t next_seq_expected;  // The ACK number we send.

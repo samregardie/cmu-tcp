@@ -208,11 +208,19 @@ def test_large_transfer_split_and_intact():
         fin = peer.recv_matching(lambda p: p.flags & FIN, 2 * T)
         check(fin is not None, "sender never sent a FIN")
         check(fin.seq == expected, f"FIN seq {fin.seq}, want {expected}")
-        peer.send(y + 1, (fin.seq + 1) & 0xFFFFFFFF, ACK)
+        fin_ack = (fin.seq + 1) & 0xFFFFFFFF
+        peer.send(y + 1, fin_ack, ACK)
+
+        # Close our side too; the sender should ACK our FIN, then exit after
+        # its final wait (two segment lifetimes, 2 x DEFAULT_TIMEOUT).
+        peer.send(y + 1, fin_ack, FIN | ACK)
+        last = peer.recv_matching(lambda p: p.flags == ACK, T)
+        check(last is not None, "sender did not ACK our FIN")
+        check(last.ack == y + 2, f"ACK of our FIN {last.ack}, want {y + 2}")
         try:
-            proc.wait(timeout=T)
+            proc.wait(timeout=3 * T)
         except subprocess.TimeoutExpired:
-            raise AssertionError("cmu_close did not return after all ACKed")
+            raise AssertionError("cmu_close did not return after both FINs")
     finally:
         proc.kill()
         proc.wait()

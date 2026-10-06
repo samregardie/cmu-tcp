@@ -40,6 +40,11 @@
 #define FIN_RESENDS 3
 #define FIN_GIVE_UP_MS (2 * DEFAULT_TIMEOUT)
 
+// FINAL_WAIT lasts two segment lifetimes. The project has no maximum segment
+// lifetime, so one lifetime is taken to be DEFAULT_TIMEOUT.
+#define SEGMENT_LIFETIME_MS DEFAULT_TIMEOUT
+#define FINAL_WAIT_MS (2 * SEGMENT_LIFETIME_MS)
+
 // How long each backend loop pass waits for a packet. New app data and timer
 // expiry are noticed at most this late.
 #define BACKEND_POLL_MS 1
@@ -405,8 +410,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt,
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
 
-  if (sock->state != STATE_CONNECTED &&
-      sock->state != STATE_WAITING_FOR_FIN_ACK) {
+  if (sock->state == STATE_IDLE || sock->state == STATE_SYN_SENT ||
+      sock->state == STATE_WAITING_FOR_ACK) {
     handle_handshake_message(sock, pkt, from);
     return;
   }
@@ -581,24 +586,40 @@ void *begin_backend(void *in) {
 
     // Teardown.
     if (sock->state == STATE_CONNECTED && death) {
-      if (peer_closed) {
-        break;  // Peer already closed: no FIN of our own.
-      }
       int all_acked =
           w->unsent_len == 0 && w->oldest_pending == w->able_to_send;
       int gave_up = w->timeouts_without_ack >= MAX_HANDSHAKE_ATTEMPTS;
       if (all_acked || gave_up) {
+        w->peer_closed_first = peer_closed;
         start_close(sock);
       }
     } else if (sock->state == STATE_WAITING_FOR_FIN_ACK) {
       int64_t now = now_ms();
       if (!before(w->oldest_pending, w->fin_seq + 1) || now >= w->fin_give_up) {
-        break;  // FIN ACKed, or out of time.
-      }
-      if (w->fin_resends < FIN_RESENDS && now >= w->fin_next_resend) {
+        // FIN ACKed, or out of time.
+        if (w->peer_closed_first) {
+          break;  // Both sides done; we were second.
+        } else if (peer_closed) {
+          sock->state = STATE_FINAL_WAIT;  // Peer's FIN came after ours.
+          w->final_wait_end = now + FINAL_WAIT_MS;
+        } else {
+          sock->state = STATE_WAITING_FOR_PEER_FIN;
+        }
+      } else if (w->fin_resends < FIN_RESENDS && now >= w->fin_next_resend) {
         send_fin(sock);
         w->fin_resends++;
         w->fin_next_resend = now + FIN_GIVE_UP_MS / (FIN_RESENDS + 1);
+      }
+    } else if (sock->state == STATE_WAITING_FOR_PEER_FIN) {
+      // Still receiving and ACKing the peer's data until its FIN arrives.
+      if (peer_closed) {
+        sock->state = STATE_FINAL_WAIT;
+        w->final_wait_end = now_ms() + FINAL_WAIT_MS;
+      }
+    } else if (sock->state == STATE_FINAL_WAIT) {
+      // Retransmitted FINs are re-ACKed by handle_fin().
+      if (now_ms() >= w->final_wait_end) {
+        break;
       }
     }
 
@@ -608,21 +629,14 @@ void *begin_backend(void *in) {
       check_for_data(sock, NO_WAIT);
     }
 
-    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    // 3. Send whatever fits in the window (not after our FIN). Receiving
+    // the peer's FIN doesn't stop us sending our own data.
+    if (sock->state == STATE_CONNECTED) {
+      send_ready(sock);
     }
-    peer_closed = sock->peer_fin_received;
-    pthread_mutex_unlock(&(sock->recv_lock));
 
-    // Once the peer has closed, stop sending our own data.
-    if (!peer_closed) {
-      // 3. Send whatever fits in the window (not after our FIN).
-      if (sock->state == STATE_CONNECTED) {
-        send_ready(sock);
-      }
-
-      // 4. Retransmit if the timer expired.
-      check_timer(sock);
-    }
+    // 4. Retransmit if the timer expired.
+    check_timer(sock);
 
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
     }
